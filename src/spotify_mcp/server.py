@@ -18,54 +18,17 @@ Usage:
 """
 
 import asyncio
-import base64
-import hashlib
-import secrets
-import tempfile
-import stat
-import re
 import json
-import os
-import sys
-import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import re
 from typing import Optional
-from urllib.parse import urlencode, urlparse, parse_qs
 
 import httpx
-from pydantic import Field
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field
 
-# ── Server ────────────────────────────────────────────────────────────────────
+from .client import RateLimited, _api, _delete, _get, _post, _put, _track_uri
+
 mcp = FastMCP("spotify-mcp")
-
-# ── Constants ─────────────────────────────────────────────────────────────────
-SPOTIFY_API = "https://api.spotify.com/v1"
-SPOTIFY_AUTH_URL = "https://accounts.spotify.com/authorize"
-SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
-
-CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID", "")
-CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
-REDIRECT_URI = os.environ.get("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8080/callback")
-
-CACHE_PATH = os.environ.get(
-    "SPOTIFY_CACHE_PATH",
-    os.path.join(os.path.expanduser("~"), ".spotify_mcp_cache.json"),
-)
-
-SCOPES = " ".join([
-    "user-top-read",
-    "user-library-read",
-
-    "user-read-playback-state",
-
-    "user-read-currently-playing",
-    "user-read-recently-played",
-    "playlist-read-private",
-    "playlist-read-collaborative",
-    "playlist-modify-private",
-
-])
 
 DEV_LIMIT = 10  # Spotify Dev Mode: max search results per request (Feb 2026)
 PAGE_LIMIT = 50  # Spotify max page size for playlist/library item listings
@@ -76,119 +39,9 @@ TRACKS_UNAVAILABLE = (
 )
 
 
-# ── Token Management ─────────────────────────────────────────────────────────
-_token_cache: dict = {}
-
-
-def _load_token() -> dict:
-    global _token_cache
-    if _token_cache:
-        return _token_cache
-    try:
-        fd = os.open(CACHE_PATH, os.O_RDONLY | os.O_NOFOLLOW)
-        with os.fdopen(fd) as f:
-            info = os.fstat(f.fileno())
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
-                raise RuntimeError("Token cache must be a regular file owned by you.")
-            os.fchmod(f.fileno(), 0o600)
-            _token_cache = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        pass
-    return _token_cache
-
-
-def _save_token(token: dict):
-    global _token_cache
-    parent = os.path.dirname(os.path.abspath(CACHE_PATH))
-    fd, temporary = tempfile.mkstemp(prefix=".spotify-token-", dir=parent)
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(token, f)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(temporary, CACHE_PATH)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
-    _token_cache = token
-
-
-async def _get_access_token() -> str:
-    token = _load_token()
-    if not token:
-        raise RuntimeError(
-            "No Spotify token found. Run `spotify-mcp --auth` first."
-        )
-    if token.get("expires_at", 0) < time.time() + 60:
-        token = await _refresh_token(token["refresh_token"])
-    return token["access_token"]
-
-
-async def _refresh_token(refresh_token: str) -> dict:
-    async with httpx.AsyncClient() as c:
-        resp = await c.post(SPOTIFY_TOKEN_URL, data={
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": CLIENT_ID,
-        })
-        resp.raise_for_status()
-        data = resp.json()
-        data["refresh_token"] = data.get("refresh_token", refresh_token)
-        data["expires_at"] = time.time() + data.get("expires_in", 3600)
-        _save_token(data)
-        return data
-
-
-# ── HTTP Helpers ─────────────────────────────────────────────────────────────
-_http: Optional[httpx.AsyncClient] = None
-
-
-def _get_http() -> httpx.AsyncClient:
-    global _http
-    if _http is None:
-        _http = httpx.AsyncClient(timeout=15)
-    return _http
-
-
-async def _api(method: str, path: str, **kwargs) -> Optional[dict]:
-    """Make an authenticated request to the Spotify API."""
-    # Paths are built locally, never accept traversal or injected query parameters.
-    parsed_path = urlparse(path)
-    if (parsed_path.scheme or parsed_path.netloc or parsed_path.fragment
-            or "%" in path or "\\" in path
-            or any(part in (".", "..") for part in parsed_path.path.split("/"))):
-        raise ValueError("Invalid Spotify API path")
-    token = await _get_access_token()
-    headers = {"Authorization": f"Bearer {token}"}
-    resp = await _get_http().request(
-        method, f"{SPOTIFY_API}/{path}", headers=headers, **kwargs
-    )
-    resp.raise_for_status()
-    if resp.status_code == 204 or not resp.content:
-        return None
-    try:
-        return resp.json()
-    except (json.JSONDecodeError, ValueError):
-        return None
-
-
-async def _get(path: str, **params) -> Optional[dict]:
-    return await _api("GET", path, params=params)
-
-
-async def _put(path: str, json_data: dict = None) -> Optional[dict]:
-    return await _api("PUT", path, json=json_data)
-
-
-async def _post(path: str, json_data: dict = None) -> Optional[dict]:
-    return await _api("POST", path, json=json_data)
-
-
-async def _delete(path: str, json_data: dict = None) -> Optional[dict]:
-    return await _api("DELETE", path, json=json_data)
-
-
 def _handle_error(e: Exception) -> str:
+    if isinstance(e, RateLimited):
+        return f"Error 429: Rate limited. Try again in {e.seconds} seconds."
     if isinstance(e, httpx.HTTPStatusError):
         status = e.response.status_code
         try:
@@ -196,7 +49,9 @@ def _handle_error(e: Exception) -> str:
         except Exception:
             msg = ""
         if status == 401:
-            return f"Error 401: Token expired or invalid. Try `spotify-mcp --auth`. {msg}"
+            return (
+                f"Error 401: Token expired or invalid. Try `spotify-mcp --auth`. {msg}"
+            )
         if status == 403:
             return f"Error 403: Forbidden. {msg}"
         if status == 404:
@@ -265,7 +120,9 @@ def _parse_artist(a: dict, detailed: bool = False) -> Optional[dict]:
     return r
 
 
-def _parse_playlist(p: dict, username: str = None, detailed: bool = False) -> Optional[dict]:
+def _parse_playlist(
+    p: dict, username: str = None, detailed: bool = False
+) -> Optional[dict]:
     """Parse playlist. Handles Feb 2026 API field renames: tracks->items, track->item."""
     if not p:
         return None
@@ -324,13 +181,19 @@ async def _ensure_device() -> Optional[str]:
 # ── Tools ────────────────────────────────────────────────────────────────────
 @mcp.tool()
 async def spotify_playback(
-    action: str = Field(description="Action: 'get', 'start', 'pause', 'skip', 'previous', or 'volume'"),
+    action: str = Field(
+        description="Action: 'get', 'start', 'pause', 'skip', 'previous', or 'volume'"
+    ),
     spotify_uri: Optional[str] = Field(
         default=None,
         description="Spotify URI to play (e.g. spotify:track:xxx). For 'start' action.",
     ),
-    num_skips: int = Field(default=1, description="Number of tracks to skip (for 'skip' action)"),
-    volume_percent: Optional[int] = Field(default=None, description="Volume level 0-100 (for 'volume' action)"),
+    num_skips: int = Field(
+        default=1, description="Number of tracks to skip (for 'skip' action)"
+    ),
+    volume_percent: Optional[int] = Field(
+        default=None, description="Volume level 0-100 (for 'volume' action)"
+    ),
 ) -> str:
     """Control Spotify playback - get current track, start/pause/skip, go to previous track, or set volume."""
     try:
@@ -443,7 +306,9 @@ async def spotify_queue(
             case "add":
                 if not track_uri:
                     return "Error: track_uri is required."
-                await _api("POST", "me/player/queue", params={"uri": _track_uri(track_uri)})
+                await _api(
+                    "POST", "me/player/queue", params={"uri": _track_uri(track_uri)}
+                )
                 return "Track added to queue."
 
             case _:
@@ -454,7 +319,9 @@ async def spotify_queue(
 
 @mcp.tool()
 async def spotify_get_info(
-    item_uri: str = Field(description="Spotify URI (e.g. spotify:track:xxx, spotify:album:xxx)"),
+    item_uri: str = Field(
+        description="Spotify URI (e.g. spotify:track:xxx, spotify:album:xxx)"
+    ),
 ) -> str:
     """Get detailed information about any Spotify item by URI."""
     try:
@@ -485,7 +352,9 @@ async def spotify_get_info(
             case "playlist":
                 username = await _get_username()
                 data = await _get(f"playlists/{item_id}")
-                return json.dumps(_parse_playlist(data, username, detailed=True), indent=2)
+                return json.dumps(
+                    _parse_playlist(data, username, detailed=True), indent=2
+                )
 
             case _:
                 return f"Unknown type: {qtype}"
@@ -497,14 +366,18 @@ async def spotify_get_info(
 async def spotify_playlist(
     action: str = Field(
         description="Action: 'get', 'get_tracks', 'add_tracks', 'remove_tracks', "
-                    "'change_details', 'create', 'delete'"
+        "'change_details', 'create', 'delete'"
     ),
     playlist_id: Optional[str] = Field(default=None, description="Playlist ID"),
     track_ids: Optional[list[str]] = Field(
         default=None, description="List of track IDs or URIs"
     ),
-    name: Optional[str] = Field(default=None, description="Playlist name (for create/change_details)"),
-    description: Optional[str] = Field(default=None, description="Playlist description"),
+    name: Optional[str] = Field(
+        default=None, description="Playlist name (for create/change_details)"
+    ),
+    description: Optional[str] = Field(
+        default=None, description="Playlist description"
+    ),
     public: bool = Field(default=False, description="Whether playlist is public"),
 ) -> str:
     """Manage Spotify playlists - list, create, modify, delete."""
@@ -580,17 +453,23 @@ async def spotify_playlist(
             case "create":
                 if not name:
                     return "Error: name is required."
-                data = await _post("me/playlists", {
-                    "name": name,
-                    "description": description or "",
-                    "public": public,
-                })
-                return json.dumps({
-                    "name": data["name"],
-                    "id": data["id"],
-                    "owner": data.get("owner", {}).get("display_name"),
-                    "public": data.get("public"),
-                }, indent=2)
+                data = await _post(
+                    "me/playlists",
+                    {
+                        "name": name,
+                        "description": description or "",
+                        "public": public,
+                    },
+                )
+                return json.dumps(
+                    {
+                        "name": data["name"],
+                        "id": data["id"],
+                        "owner": data.get("owner", {}).get("display_name"),
+                        "public": data.get("public"),
+                    },
+                    indent=2,
+                )
 
             case "delete":
                 if not playlist_id:
@@ -606,9 +485,17 @@ async def spotify_playlist(
 
 @mcp.tool()
 async def spotify_liked_songs(
-    action: str = Field(default="get", description="Action: 'get', 'get_with_genres', 'like', 'unlike', or 'check'"),
-    limit: int = Field(default=0, description="Max songs to return (0 = all, for 'get'/'get_with_genres')"),
-    track_ids: Optional[list[str]] = Field(default=None, description="Track IDs or URIs to like/unlike"),
+    action: str = Field(
+        default="get",
+        description="Action: 'get', 'get_with_genres', 'like', 'unlike', or 'check'",
+    ),
+    limit: int = Field(
+        default=0,
+        description="Max songs to return (0 = all, for 'get'/'get_with_genres')",
+    ),
+    track_ids: Optional[list[str]] = Field(
+        default=None, description="Track IDs or URIs to like/unlike"
+    ),
 ) -> str:
     """Get user's liked/saved songs, or like/unlike tracks."""
     try:
@@ -617,7 +504,10 @@ async def spotify_liked_songs(
         if action == "like":
             if not track_ids:
                 return "Error: track_ids is required."
-            uris = [f"spotify:track:{t}" if not t.startswith("spotify:") else t for t in track_ids]
+            uris = [
+                f"spotify:track:{t}" if not t.startswith("spotify:") else t
+                for t in track_ids
+            ]
             uris_param = ",".join(uris)
             await _api("PUT", f"me/library?uris={uris_param}")
             return f"Liked {len(uris)} track(s)."
@@ -625,7 +515,10 @@ async def spotify_liked_songs(
         if action == "unlike":
             if not track_ids:
                 return "Error: track_ids is required."
-            uris = [f"spotify:track:{t}" if not t.startswith("spotify:") else t for t in track_ids]
+            uris = [
+                f"spotify:track:{t}" if not t.startswith("spotify:") else t
+                for t in track_ids
+            ]
             uris_param = ",".join(uris)
             await _api("DELETE", f"me/library?uris={uris_param}")
             return f"Unliked {len(uris)} track(s)."
@@ -633,9 +526,12 @@ async def spotify_liked_songs(
         if action == "check":
             if not track_ids:
                 return "Error: track_ids is required."
-            uris = [f"spotify:track:{t}" if not t.startswith("spotify:") else t for t in track_ids]
+            uris = [
+                f"spotify:track:{t}" if not t.startswith("spotify:") else t
+                for t in track_ids
+            ]
             uris_param = ",".join(uris)
-            data = await _get(f"me/library/contains", uris=uris_param)
+            data = await _get("me/library/contains", uris=uris_param)
             if not data:
                 return "Error: could not check library."
             results = {uri: liked for uri, liked in zip(uris, data)}
@@ -685,10 +581,13 @@ async def spotify_liked_songs(
             genres_map = dict(results)
 
             for t in tracks:
-                t["genres"] = list({
-                    g for aid in t.pop("artist_ids", [])
-                    for g in genres_map.get(aid, [])
-                })
+                t["genres"] = list(
+                    {
+                        g
+                        for aid in t.pop("artist_ids", [])
+                        for g in genres_map.get(aid, [])
+                    }
+                )
         else:
             for t in tracks:
                 t.pop("artist_ids", None)
@@ -700,7 +599,9 @@ async def spotify_liked_songs(
 
 @mcp.tool()
 async def spotify_recently_played(
-    limit: int = Field(default=10, description="Number of recently played tracks to return (max 50)"),
+    limit: int = Field(
+        default=10, description="Number of recently played tracks to return (max 50)"
+    ),
 ) -> str:
     """Get the user's recently played tracks with timestamps."""
     try:
@@ -723,7 +624,8 @@ async def spotify_recently_played(
 async def spotify_devices(
     action: str = Field(description="Action: 'list' or 'transfer'"),
     device_id: Optional[str] = Field(
-        default=None, description="Device ID to transfer playback to (for 'transfer' action)"
+        default=None,
+        description="Device ID to transfer playback to (for 'transfer' action)",
     ),
 ) -> str:
     """List available Spotify devices or transfer playback to a different device."""
@@ -736,13 +638,15 @@ async def spotify_devices(
                     return "No devices found. Open Spotify on a device first."
                 result = []
                 for d in devices:
-                    result.append({
-                        "id": d["id"],
-                        "name": d.get("name"),
-                        "type": d.get("type"),
-                        "is_active": d.get("is_active", False),
-                        "volume_percent": d.get("volume_percent"),
-                    })
+                    result.append(
+                        {
+                            "id": d["id"],
+                            "name": d.get("name"),
+                            "type": d.get("type"),
+                            "is_active": d.get("is_active", False),
+                            "volume_percent": d.get("volume_percent"),
+                        }
+                    )
                 return json.dumps(result, indent=2)
 
             case "transfer":
@@ -755,85 +659,3 @@ async def spotify_devices(
                 return f"Unknown action: {action}"
     except Exception as e:
         return _handle_error(e)
-
-
-# ── OAuth Auth Flow ──────────────────────────────────────────────────────────
-def _track_uri(value: str) -> str:
-    value = value.removeprefix("spotify:track:")
-    if not re.fullmatch(r"[A-Za-z0-9]{22}", value):
-        raise ValueError("Invalid track ID")
-    return "spotify:track:" + value
-
-
-def _callback_values(path: str, expected_path: str, state: str):
-    parsed = urlparse(path)
-    qs = parse_qs(parsed.query)
-    if parsed.path != expected_path or len(qs.get("state", [])) != 1:
-        return None
-    if not secrets.compare_digest(qs["state"][0], state):
-        return None
-    if "error" in qs:
-        return (None, "Authorization denied")
-    codes = qs.get("code", [])
-    return (codes[0], None) if len(codes) == 1 and codes[0] else None
-
-
-def run_auth():
-    """Local OAuth with state validation and PKCE; no client secret required."""
-    import webbrowser
-
-    if not CLIENT_ID:
-        raise RuntimeError("Set SPOTIFY_CLIENT_ID first.")
-    parsed = urlparse(REDIRECT_URI)
-    if (parsed.scheme != "http" or parsed.hostname != "127.0.0.1"
-            or not parsed.port or parsed.path != "/callback"
-            or parsed.query or parsed.fragment or parsed.username or parsed.password):
-        raise ValueError("Redirect must be http://127.0.0.1:PORT/callback")
-    state = secrets.token_urlsafe(32)
-    verifier = secrets.token_urlsafe(64)
-    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
-    params = {"client_id": CLIENT_ID, "response_type": "code",
-              "redirect_uri": REDIRECT_URI, "scope": SCOPES, "state": state,
-              "code_challenge_method": "S256", "code_challenge": challenge}
-    result = None
-
-    class Handler(BaseHTTPRequestHandler):
-        def setup(self):
-            super().setup()
-            self.connection.settimeout(2)
-
-        def do_GET(self):
-            nonlocal result
-            value = _callback_values(self.path, parsed.path, state)
-            if value is not None:
-                result = value
-            self.send_response(200 if value and value[0] else 400)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Security-Policy", "default-src 'none'")
-            self.end_headers()
-            self.wfile.write(b"Return to the terminal to finish authorization.")
-
-        def log_message(self, format, *args):
-            pass
-
-    with HTTPServer(("127.0.0.1", parsed.port), Handler) as server:
-        server.timeout = 1
-        url = SPOTIFY_AUTH_URL + "?" + urlencode(params)
-        print("Open this URL to authorize Spotify:\n" + url)
-        webbrowser.open(url)
-        deadline = time.monotonic() + 180
-        while result is None and time.monotonic() < deadline:
-            server.handle_request()
-    if not result or not result[0]:
-        raise RuntimeError("Authorization denied or timed out; no token saved.")
-    resp = httpx.post(SPOTIFY_TOKEN_URL, data={
-        "grant_type": "authorization_code", "code": result[0],
-        "redirect_uri": REDIRECT_URI, "client_id": CLIENT_ID,
-        "code_verifier": verifier,
-    }, timeout=15)
-    resp.raise_for_status()
-    token = resp.json()
-    token["expires_at"] = time.time() + token.get("expires_in", 3600)
-    _save_token(token)
-    print("Spotify authorization saved with owner-only file permissions.")

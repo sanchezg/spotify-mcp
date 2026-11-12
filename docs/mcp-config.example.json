@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "spotify-albums": {
+      "command": "/absolute/path/to/uv",
+      "args": [
+        "--directory", "/absolute/path/to/spotify-mcp",
+        "run", "--locked", "spotify-mcp", "--profile", "albums"
+      ],
+      "env": {
+        "SPOTIFY_CLIENT_ID": "YOUR_SPOTIFY_CLIENT_ID",
+        "SPOTIFY_ALBUM_HOME": "/absolute/private/path/spotify-albums-personal"
+      }
+    }
+  }
+}

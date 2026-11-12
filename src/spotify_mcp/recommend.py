@@ -1,4 +1,5 @@
 """Local, deterministic playlist planning. Never sends listening data to an LLM."""
+
 import argparse
 import asyncio
 import json
@@ -6,7 +7,7 @@ from collections import Counter
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from . import server
+from . import client, server
 
 
 class Preferences(BaseModel):
@@ -35,14 +36,21 @@ async def plan(prefs: Preferences) -> dict:
         if not track.get("id") or track.get("type", "track") != "track":
             return
         names = [a.get("name", "") for a in track.get("artists", [])]
-        if set(n.casefold() for n in names) & set(n.casefold() for n in prefs.excluded_artists):
+        if set(n.casefold() for n in names) & set(
+            n.casefold() for n in prefs.excluded_artists
+        ):
             return
         if prefs.exclude_explicit and track.get("explicit", True):
             return
         uri = server._track_uri(track["id"])
         if uri not in candidates:
-            candidates[uri] = {"uri": uri, "name": track.get("name", ""), "artists": names,
-                               "score": 0, "reasons": []}
+            candidates[uri] = {
+                "uri": uri,
+                "name": track.get("name", ""),
+                "artists": names,
+                "score": 0,
+                "reasons": [],
+            }
         candidate = candidates[uri]
         candidate["score"] += score
         if reason not in candidate["reasons"]:
@@ -62,9 +70,13 @@ async def plan(prefs: Preferences) -> dict:
             continue
         for index, item in enumerate((data or {}).get("items", [])):
             track = item.get("track") if label == "recent listening" else item
-            add(track, 2 if label == "recent listening" else (50-index)/10, label)
+            add(track, 2 if label == "recent listening" else (50 - index) / 10, label)
     for uri in dict.fromkeys(recommended):
-        add(await server._get("tracks/" + uri.split(":")[-1]), 100, "your recommendation")
+        add(
+            await server._get("tracks/" + uri.split(":")[-1]),
+            100,
+            "your recommendation",
+        )
     favorite = {a.casefold() for a in prefs.favorite_artists}
     for candidate in candidates.values():
         if favorite & {a.casefold() for a in candidate["artists"]}:
@@ -81,8 +93,15 @@ async def plan(prefs: Preferences) -> dict:
         if len(selected) == prefs.size:
             break
     if len(selected) < prefs.size:
-        warnings.append(f"Only {len(selected)} tracks match the available history and filters.")
-    return {"name": prefs.name, "public": False, "tracks": selected, "warnings": warnings}
+        warnings.append(
+            f"Only {len(selected)} tracks match the available history and filters."
+        )
+    return {
+        "name": prefs.name,
+        "public": False,
+        "tracks": selected,
+        "warnings": warnings,
+    }
 
 
 async def create(mix: dict) -> dict:
@@ -90,8 +109,14 @@ async def create(mix: dict) -> dict:
     uris = [server._track_uri(t["uri"]) for t in mix["tracks"]]
     if not 1 <= len(uris) <= 100:
         raise ValueError("A playlist must contain 1–100 tracks")
-    playlist = await server._post("me/playlists", {"name": mix["name"], "public": False,
-        "description": "A personal mix selected locally from listening history and recommendations."})
+    playlist = await server._post(
+        "me/playlists",
+        {
+            "name": mix["name"],
+            "public": False,
+            "description": "A personal mix selected locally from listening history and recommendations.",
+        },
+    )
     playlist_id = playlist["id"]
     if not server.re.fullmatch(r"[A-Za-z0-9]{22}", playlist_id):
         raise RuntimeError("Spotify returned an invalid playlist ID")
@@ -99,15 +124,23 @@ async def create(mix: dict) -> dict:
     try:
         await server._post(f"playlists/{playlist_id}/items", {"uris": uris})
     except Exception as exc:
-        raise RuntimeError(f"Playlist created at {url}, but adding tracks failed or is uncertain. "
-                           "Inspect it before retrying; rerunning create makes another playlist.") from exc
+        raise RuntimeError(
+            f"Playlist created at {url}, but adding tracks failed or is uncertain. "
+            "Inspect it before retrying; rerunning create makes another playlist."
+        ) from exc
     return {"url": url, "count": len(uris), "public": False}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--preferences", required=True, help="Local preferences JSON file")
-    parser.add_argument("--create", action="store_true", help="Preview, then ask before creating a private playlist")
+    parser.add_argument(
+        "--preferences", required=True, help="Local preferences JSON file"
+    )
+    parser.add_argument(
+        "--create",
+        action="store_true",
+        help="Preview, then ask before creating a private playlist",
+    )
     args = parser.parse_args()
 
     async def run():
@@ -117,13 +150,18 @@ def main():
             mix = await plan(prefs)
             print(json.dumps(mix, indent=2, ensure_ascii=False))
             if args.create and mix["tracks"]:
-                if input("Create this private playlist? Type yes: ").strip().lower() == "yes":
+                if (
+                    input("Create this private playlist? Type yes: ").strip().lower()
+                    == "yes"
+                ):
                     print(json.dumps(await create(mix), indent=2))
         finally:
-            if server._http is not None:
-                await server._http.aclose()
-                server._http = None
+            await client.close()
+
     try:
         asyncio.run(run())
     except (ValueError, OSError, RuntimeError, server.httpx.HTTPError) as exc:
-        parser.exit(1, f"{exc if isinstance(exc, RuntimeError) else server._handle_error(exc)}\n")
+        parser.exit(
+            1,
+            f"{exc if isinstance(exc, RuntimeError) else server._handle_error(exc)}\n",
+        )

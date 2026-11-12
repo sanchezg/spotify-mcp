@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.5.0] - 2026-11-12
+
+- Added an isolated albums MCP profile with plan, create, and status/resume tools.
+- Resolve standard album editions conservatively and collect complete multi-disc tracklists.
+- Create private playlists in batches, with account-bound plans, process locks,
+  durable recovery records, and ordered content verification.
+- Extracted shared PKCE/auth and HTTP transport; added read-only retries, rate-limit
+  reporting, a local diagnostic command, and local preview/selection/purge commands.
+- Added agent workflow instructions, MCP configuration, and automated stdio tests.
+- Preserved the separate listening-history CLI and legacy MCP profile.
+- Live Spotify testing deferred at the user's request; automated tests only.
+
 ## [0.4.0] - 2026-03-17
 
 ### Architecture Rewrite

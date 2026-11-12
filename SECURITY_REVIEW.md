@@ -55,3 +55,54 @@ References: [PKCE](https://developer.spotify.com/documentation/web-api/tutorials
 [top items](https://developer.spotify.com/documentation/web-api/reference/get-users-top-artists-and-tracks),
 [API migration](https://developer.spotify.com/documentation/web-api/tutorials/february-2026-migration-guide),
 [developer policy](https://developer.spotify.com/policy).
+
+
+## Album workflow update — version 0.5.0
+
+The new profile is implemented in `album_server.py`, `albums.py`, and `storage.py`.
+Shared OAuth/HTTP code moved into `client.py`; the original MCP surface remains in
+`server.py`. Existing token/auth regression tests now target the shared client.
+
+- Album-profile tokens are isolated by profile and Client ID under a private
+  configurable home. Its scopes are private playlist read/write only. Operation
+  records bind to a fingerprint of Spotify's immutable `account_id`, not display name or mutable `id`.
+- Only three workflow tools are registered. Spotify catalog metadata and track
+  lists are not returned to agent tools; local human inspection remains available.
+  HTTP-client request logging is suppressed in this profile to avoid catalog URLs
+  in host logs. Agent recommendations use independently supplied artist/album names.
+- A random plan ID is a local reference, not an authentication or consent token.
+  Hosts must enforce their own tool authorization. The user's explicit create
+  request authorizes the normal flow; the server cannot prove conversational consent.
+- State directories are owner-only; JSON files use atomic replacement, file and
+  directory fsync, owner-only permissions, and no-follow reads. Nonblocking process
+  locks prevent concurrent execution of the same plan. Lock files remain after
+  purging to avoid replacing an inode that another process already opened.
+- Ready plans expire after one hour; completed catalog plans become minimal
+  24-hour receipts. Expiry cleanup runs on planning/inspection, not a background
+  timer. Incomplete operation state persists for recovery until completed/purged.
+- Planning validates input limits and exact Spotify link forms. All API hosts are
+  fixed; pagination uses local offsets and never follows response URLs with tokens.
+- Writes are journaled before sending. Known creation rejections may be retried
+  explicitly; ambiguous creation is never retried automatically. Uncertain add
+  operations reconcile only a recognized ordered prefix, preserving user edits.
+- Final verification reads owner, private visibility, ordered playlist items and
+  a stable snapshot. Completion means verified at that moment; a cached receipt
+  is not a fresh check of later user edits. A user can still modify Spotify during
+  the narrow interval between a readback and a subsequent write; Spotify offers
+  no conditional append primitive used here. Unexpected final contents are reported
+  as unverified rather than silently rewritten.
+- Read requests have bounded transient retries; 429 returns a retry deadline.
+  Mutation requests are never blindly retried. Token refresh is serialized within
+  a process; multiple processes sharing a token home may still race on refresh.
+  Prefer one running host per token home, and restart hosts after reauthorization.
+- Limits and matching favor explicit failure over silently incomplete albums.
+  Playback availability may be unknown even when catalog membership is verified.
+
+Automated verification covers both successful full-album creation and protocol,
+filesystem, account-binding, expiry, concurrency, crash/restart, rate-limit,
+ambiguity, relinking, and partial-write cases. Two stdio clients exercise the actual
+MCP protocol with a fake Spotify backend. These are not a live penetration test or
+proof of compatibility with every agent host. Per the user's instruction, live
+Spotify authorization and playlist creation are deferred (automated tests only).
+The dependency versions are unchanged from the earlier audited lockfile; only the
+local package version changes to 0.5.0. The prior audit remains point-in-time.

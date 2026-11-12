@@ -33,3 +33,8 @@ venv/
 .spotify-token-*
 playlist-plan.json
 preferences.json
+
+# Never commit local OAuth / album workflow state
+token.json
+.spotify-albums/
+.ruff_cache/
