@@ -1,0 +1,10 @@
+{
+  "name": "My personal mix",
+  "size": 30,
+  "time_range": "medium_term",
+  "recommendations": [],
+  "favorite_artists": [],
+  "excluded_artists": [],
+  "exclude_explicit": false,
+  "max_per_artist": 3
+}

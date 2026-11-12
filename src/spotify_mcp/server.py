@@ -18,6 +18,12 @@ Usage:
 """
 
 import asyncio
+import base64
+import hashlib
+import secrets
+import tempfile
+import stat
+import re
 import json
 import os
 import sys
@@ -48,16 +54,17 @@ CACHE_PATH = os.environ.get(
 )
 
 SCOPES = " ".join([
+    "user-top-read",
     "user-library-read",
-    "user-library-modify",
+
     "user-read-playback-state",
-    "user-modify-playback-state",
+
     "user-read-currently-playing",
     "user-read-recently-played",
     "playlist-read-private",
     "playlist-read-collaborative",
     "playlist-modify-private",
-    "playlist-modify-public",
+
 ])
 
 DEV_LIMIT = 10  # Spotify Dev Mode: max search results per request (Feb 2026)
@@ -78,7 +85,12 @@ def _load_token() -> dict:
     if _token_cache:
         return _token_cache
     try:
-        with open(CACHE_PATH) as f:
+        fd = os.open(CACHE_PATH, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd) as f:
+            info = os.fstat(f.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                raise RuntimeError("Token cache must be a regular file owned by you.")
+            os.fchmod(f.fileno(), 0o600)
             _token_cache = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         pass
@@ -87,9 +99,18 @@ def _load_token() -> dict:
 
 def _save_token(token: dict):
     global _token_cache
+    parent = os.path.dirname(os.path.abspath(CACHE_PATH))
+    fd, temporary = tempfile.mkstemp(prefix=".spotify-token-", dir=parent)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(token, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, CACHE_PATH)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
     _token_cache = token
-    with open(CACHE_PATH, "w") as f:
-        json.dump(token, f, indent=2)
 
 
 async def _get_access_token() -> str:
@@ -109,7 +130,6 @@ async def _refresh_token(refresh_token: str) -> dict:
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
             "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
         })
         resp.raise_for_status()
         data = resp.json()
@@ -132,6 +152,12 @@ def _get_http() -> httpx.AsyncClient:
 
 async def _api(method: str, path: str, **kwargs) -> Optional[dict]:
     """Make an authenticated request to the Spotify API."""
+    # Paths are built locally, never accept traversal or injected query parameters.
+    parsed_path = urlparse(path)
+    if (parsed_path.scheme or parsed_path.netloc or parsed_path.fragment
+            or "%" in path or "\\" in path
+            or any(part in (".", "..") for part in parsed_path.path.split("/"))):
+        raise ValueError("Invalid Spotify API path")
     token = await _get_access_token()
     headers = {"Authorization": f"Bearer {token}"}
     resp = await _get_http().request(
@@ -178,7 +204,9 @@ def _handle_error(e: Exception) -> str:
         if status == 429:
             return "Error 429: Rate limited. Try again later."
         return f"Error {status}: {msg or 'Spotify API error.'}"
-    return f"Error: {e}"
+    if isinstance(e, ValueError):
+        return "Error: Invalid input."
+    return "Error: Spotify request failed. Check authentication and connectivity."
 
 
 # ── Parsers ──────────────────────────────────────────────────────────────────
@@ -336,7 +364,7 @@ async def spotify_playback(
                 return "Playback paused."
 
             case "skip":
-                for _ in range(num_skips):
+                for _ in range(max(1, min(20, num_skips))):
                     await _post("me/player/next")
                 return f"Skipped {num_skips} track(s)."
 
@@ -368,7 +396,7 @@ async def spotify_search(
 ) -> str:
     """Search Spotify for tracks, albums, artists, or playlists."""
     try:
-        limit = min(limit, DEV_LIMIT)
+        limit = max(1, min(limit, DEV_LIMIT))
         data = await _get("search", q=query, type=qtype, limit=limit)
         if not data:
             return "No results found."
@@ -415,7 +443,7 @@ async def spotify_queue(
             case "add":
                 if not track_uri:
                     return "Error: track_uri is required."
-                await _post(f"me/player/queue?uri={track_uri}")
+                await _api("POST", "me/player/queue", params={"uri": _track_uri(track_uri)})
                 return "Track added to queue."
 
             case _:
@@ -433,7 +461,9 @@ async def spotify_get_info(
         parts = item_uri.split(":")
         if len(parts) != 3:
             return f"Invalid URI format: {item_uri}"
-        _, qtype, item_id = parts
+        prefix, qtype, item_id = parts
+        if prefix != "spotify" or not re.fullmatch(r"[A-Za-z0-9]{22}", item_id):
+            raise ValueError("Invalid Spotify URI")
 
         match qtype:
             case "track":
@@ -475,10 +505,14 @@ async def spotify_playlist(
     ),
     name: Optional[str] = Field(default=None, description="Playlist name (for create/change_details)"),
     description: Optional[str] = Field(default=None, description="Playlist description"),
-    public: bool = Field(default=True, description="Whether playlist is public"),
+    public: bool = Field(default=False, description="Whether playlist is public"),
 ) -> str:
     """Manage Spotify playlists - list, create, modify, delete."""
     try:
+        if playlist_id and not re.fullmatch(r"[A-Za-z0-9]{22}", playlist_id):
+            raise ValueError("Invalid playlist ID")
+        if track_ids:
+            track_ids = [_track_uri(t) for t in track_ids]
         username = await _get_username()
 
         match action:
@@ -578,6 +612,8 @@ async def spotify_liked_songs(
 ) -> str:
     """Get user's liked/saved songs, or like/unlike tracks."""
     try:
+        if track_ids:
+            track_ids = [_track_uri(t) for t in track_ids]
         if action == "like":
             if not track_ids:
                 return "Error: track_ids is required."
@@ -722,83 +758,82 @@ async def spotify_devices(
 
 
 # ── OAuth Auth Flow ──────────────────────────────────────────────────────────
+def _track_uri(value: str) -> str:
+    value = value.removeprefix("spotify:track:")
+    if not re.fullmatch(r"[A-Za-z0-9]{22}", value):
+        raise ValueError("Invalid track ID")
+    return "spotify:track:" + value
+
+
+def _callback_values(path: str, expected_path: str, state: str):
+    parsed = urlparse(path)
+    qs = parse_qs(parsed.query)
+    if parsed.path != expected_path or len(qs.get("state", [])) != 1:
+        return None
+    if not secrets.compare_digest(qs["state"][0], state):
+        return None
+    if "error" in qs:
+        return (None, "Authorization denied")
+    codes = qs.get("code", [])
+    return (codes[0], None) if len(codes) == 1 and codes[0] else None
+
+
 def run_auth():
-    """Interactive OAuth flow. Run with: spotify-mcp --auth"""
+    """Local OAuth with state validation and PKCE; no client secret required."""
     import webbrowser
 
-    if not CLIENT_ID or not CLIENT_SECRET:
-        print("Error: SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET must be set.")
-        sys.exit(1)
-
-    # Normalize localhost -> 127.0.0.1
-    redirect = REDIRECT_URI
-    parsed = urlparse(redirect)
-    if parsed.hostname == "localhost":
-        port_str = f":{parsed.port}" if parsed.port else ""
-        redirect = parsed._replace(netloc=f"127.0.0.1{port_str}").geturl()
-
-    params = {
-        "client_id": CLIENT_ID,
-        "response_type": "code",
-        "redirect_uri": redirect,
-        "scope": SCOPES,
-    }
-    auth_url = f"{SPOTIFY_AUTH_URL}?{urlencode(params)}"
-
-    print(f"Opening browser for Spotify authorization...")
-    print(f"If it doesn't open, visit:\n{auth_url}\n")
-    webbrowser.open(auth_url)
-
-    # Start local callback server
-    cb_parsed = urlparse(redirect)
-    host = cb_parsed.hostname or "127.0.0.1"
-    port = cb_parsed.port or 8080
-
-    auth_code = None
+    if not CLIENT_ID:
+        raise RuntimeError("Set SPOTIFY_CLIENT_ID first.")
+    parsed = urlparse(REDIRECT_URI)
+    if (parsed.scheme != "http" or parsed.hostname != "127.0.0.1"
+            or not parsed.port or parsed.path != "/callback"
+            or parsed.query or parsed.fragment or parsed.username or parsed.password):
+        raise ValueError("Redirect must be http://127.0.0.1:PORT/callback")
+    state = secrets.token_urlsafe(32)
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    params = {"client_id": CLIENT_ID, "response_type": "code",
+              "redirect_uri": REDIRECT_URI, "scope": SCOPES, "state": state,
+              "code_challenge_method": "S256", "code_challenge": challenge}
+    result = None
 
     class Handler(BaseHTTPRequestHandler):
+        def setup(self):
+            super().setup()
+            self.connection.settimeout(2)
+
         def do_GET(self):
-            nonlocal auth_code
-            qs = parse_qs(urlparse(self.path).query)
-            if "code" in qs:
-                auth_code = qs["code"][0]
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html")
-                self.end_headers()
-                self.wfile.write(
-                    b"<h1>Authorization successful!</h1>"
-                    b"<p>You can close this tab.</p>"
-                )
-            else:
-                error = qs.get("error", ["unknown"])[0]
-                self.send_response(400)
-                self.send_header("Content-Type", "text/html")
-                self.end_headers()
-                self.wfile.write(f"<h1>Authorization failed: {error}</h1>".encode())
+            nonlocal result
+            value = _callback_values(self.path, parsed.path, state)
+            if value is not None:
+                result = value
+            self.send_response(200 if value and value[0] else 400)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Security-Policy", "default-src 'none'")
+            self.end_headers()
+            self.wfile.write(b"Return to the terminal to finish authorization.")
 
         def log_message(self, format, *args):
             pass
 
-    server = HTTPServer((host, port), Handler)
-    print(f"Waiting for callback on {host}:{port}...")
-    server.handle_request()
-
-    if not auth_code:
-        print("Error: No authorization code received.")
-        sys.exit(1)
-
-    # Exchange code for token
-    print("Exchanging code for token...")
+    with HTTPServer(("127.0.0.1", parsed.port), Handler) as server:
+        server.timeout = 1
+        url = SPOTIFY_AUTH_URL + "?" + urlencode(params)
+        print("Open this URL to authorize Spotify:\n" + url)
+        webbrowser.open(url)
+        deadline = time.monotonic() + 180
+        while result is None and time.monotonic() < deadline:
+            server.handle_request()
+    if not result or not result[0]:
+        raise RuntimeError("Authorization denied or timed out; no token saved.")
     resp = httpx.post(SPOTIFY_TOKEN_URL, data={
-        "grant_type": "authorization_code",
-        "code": auth_code,
-        "redirect_uri": redirect,
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-    })
+        "grant_type": "authorization_code", "code": result[0],
+        "redirect_uri": REDIRECT_URI, "client_id": CLIENT_ID,
+        "code_verifier": verifier,
+    }, timeout=15)
     resp.raise_for_status()
     token = resp.json()
     token["expires_at"] = time.time() + token.get("expires_in", 3600)
     _save_token(token)
-    print(f"Token saved to {CACHE_PATH}")
-    print("You can now use spotify-mcp with your MCP client.")
+    print("Spotify authorization saved with owner-only file permissions.")

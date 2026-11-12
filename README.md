@@ -1,181 +1,87 @@
-# spotify-mcp
+# Personal Spotify playlists
 
-A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that connects Claude with Spotify. Control your Spotify playback, search music, manage playlists, and more -- all through natural conversation with Claude.
+A hardened fork of [verIdyia/spotify-mcp](https://github.com/verIdyia/spotify-mcp),
+with a local playlist planner based on top tracks, recent listening, and your own
+song recommendations. See [SECURITY_REVIEW.md](SECURITY_REVIEW.md) for findings,
+fixes, and remaining limits. MIT licensed; upstream attribution is preserved in LICENSE.
 
-> **Fork Notice**: This project is forked from [varunneal/spotify-mcp](https://github.com/varunneal/spotify-mcp) and updated for the **Spotify Web API February 2026 changes**. Built and maintained with [Claude Code](https://claude.ai/claude-code).
+## Setup
 
-## What's Changed (v0.4.0)
+Requires Python 3.12+, uv, and a Spotify developer app. Development-mode access
+currently requires the app owner to have Premium; account and endpoint restrictions
+are controlled by Spotify. Register `http://127.0.0.1:8080/callback` in the
+[developer dashboard](https://developer.spotify.com/dashboard).
 
-### Architecture Rewrite
-- **Dropped `spotipy`** -- uses `httpx` async directly (native async, no `asyncio.to_thread` wrapping)
-- **Single module** -- `server.py`, `spotify_api.py`, `utils.py` consolidated into one file
-- **FastMCP** -- clean `@mcp.tool()` decorators instead of manual ToolModel + match/case routing
-- **2 dependencies** -- only `mcp` + `httpx` (was `mcp` + `spotipy` + `python-dotenv`)
-- **Explicit OAuth** -- `spotify-mcp --auth` for initial setup, auto-refresh on subsequent use
-
-### Features (preserved from v0.3.0)
-- Start, pause, and skip playback
-- Search for tracks, albums, artists, and playlists
-- Get detailed info about any Spotify item
-- Manage the playback queue
-- Full playlist CRUD (create, read, update, delete tracks)
-- Retrieve liked/saved songs with optional genre enrichment
-- Adapted for Spotify Feb 2026 API changes
-
-## How It Works
-
-```
-Claude <--MCP (stdio)--> spotify-mcp <--httpx async--> Spotify Web API
+```sh
+uv sync --locked
+export SPOTIFY_CLIENT_ID='your-client-id'
+uv run --locked spotify-mcp --auth
+cp preferences.example.json preferences.json
 ```
 
-1. Claude sends tool calls via the MCP protocol
-2. The server translates them into Spotify Web API requests using `httpx`
-3. OAuth tokens auto-refresh; initial auth via `spotify-mcp --auth`
-4. Results are parsed into concise JSON and returned to Claude
+Authorize in your browser. PKCE requires no client secret. Tokens are stored at
+`~/.spotify_mcp_cache.json` with owner-only permissions. `SPOTIFY_CACHE_PATH` can
+point to a private location outside the repository. Reauthorize if migrating from
+upstream: the new scopes include `user-top-read` and omit public playlist, library,
+and playback write access. `.env` files are not automatically loaded.
 
-### Available Tools
+## Build your mix
 
-| Tool | Actions | Description |
-|------|---------|-------------|
-| `spotify_playback` | `get`, `start`, `pause`, `skip`, `previous`, `volume` | Control music playback and volume |
-| `spotify_search` | -- | Search tracks, albums, artists, playlists |
-| `spotify_queue` | `get`, `add` | View and manage play queue |
-| `spotify_get_info` | -- | Get detailed item info by Spotify URI |
-| `spotify_playlist` | `get`, `get_tracks`, `add_tracks`, `remove_tracks`, `change_details`, `create`, `delete` | Full playlist management |
-| `spotify_liked_songs` | `get`, `get_with_genres`, `like`, `unlike`, `check` | Manage saved songs and check library |
-| `spotify_recently_played` | -- | Get recently played tracks with timestamps |
-| `spotify_devices` | `list`, `transfer` | List devices and transfer playback |
+Edit `preferences.json`:
 
-### Architecture
+- `recommendations`: Spotify track IDs or `spotify:track:ID` URIs you want included.
+- `favorite_artists`: artist names to boost (case insensitive).
+- `excluded_artists`: artist names to exclude, including collaborations.
+- `exclude_explicit`: omit explicit tracks and tracks with unknown explicit status.
+- `time_range`: `short_term`, `medium_term`, or `long_term` for top tracks.
+- `size`: 1–100; `max_per_artist`: artist diversity cap.
 
-```
-src/spotify_mcp/
-  __init__.py   # Entry point (stdio / --auth)
-  server.py     # FastMCP server, API client, parsers — all in one
+Preview without writing to Spotify:
+
+```sh
+uv run --locked spotify-mix --preferences preferences.json
 ```
 
-## Prerequisites
+Preview and create after typing `yes`:
 
-- **Python 3.12+**
-- **Spotify Premium** account (required for Dev Mode API access since Feb 2026)
-- **Spotify Developer App** credentials
-
-## Configuration
-
-### 1. Create Spotify Developer App
-
-1. Go to [developer.spotify.com/dashboard](https://developer.spotify.com/dashboard)
-2. Create a new app
-3. Set redirect URI to `http://127.0.0.1:8080/callback`
-4. Note your **Client ID** and **Client Secret**
-
-> **Important (Feb 2026)**: Dev Mode apps are limited to 5 authorized users and require the app owner to have Spotify Premium.
-
-### 2. Initial Authentication
-
-Run the auth flow once to get your OAuth token:
-
-```bash
-SPOTIFY_CLIENT_ID=your_id SPOTIFY_CLIENT_SECRET=your_secret uv run spotify-mcp --auth
+```sh
+uv run --locked spotify-mix --preferences preferences.json --create
 ```
 
-This opens a browser for Spotify login, then saves the token to `~/.spotify_mcp_cache.json`.
+The preview includes track names, artists, selection reasons, and warnings. Creation
+uses exactly that preview and always creates a **private** playlist. It never edits
+an existing playlist. A failed add operation reports the created playlist URL;
+inspect it before retrying to avoid duplicates.
 
-### 3. Add to MCP Client
+Ranking uses up to 50 top tracks and the last 50 plays: top-track rank gives 0.1–5
+points, each recent play gives 2, your recommendations give 100, and favorite
+artists add 10. Duplicates merge; exclusions and artist caps still apply to your
+recommendations. It can return fewer tracks than requested. This is a personal
+mix, not Spotify's discovery algorithm; it does not call deprecated Recommendations
+or Audio Features endpoints. Recommended songs must be supplied as IDs/URIs, not
+natural-language descriptions. No history or preferences are persisted by the
+planner; terminal output may remain in your terminal history/logging system.
 
-#### Run locally (recommended)
+## Existing MCP tools
 
-```bash
-git clone https://github.com/verIdyia/spotify-mcp.git
+`uv run --locked spotify-mcp` retains the upstream stdio tools for trusted local
+clients. Reduced scopes mean upstream playback/library write tools and public
+playlist creation will fail with 403. Do not expose this as a remote server.
+The dedicated `spotify-mix` CLI is the supported personalized-playlist workflow.
+
+The planner processes Spotify data locally with deterministic Python rules and
+makes no AI-provider calls. Original MCP tools return Spotify metadata to their
+client; using them with an LLM is a separate data-sharing decision. Review
+[Spotify's policy](https://developer.spotify.com/policy), which restricts ingestion
+of Spotify Content into AI/ML models. Local planning avoids that data flow.
+
+## Verification
+
+```sh
+uv run --locked python -m unittest discover -s tests -v
+uv run --locked --with pip-audit pip-audit --progress-spinner off
 ```
 
-Add to your MCP config (Claude Desktop, Cursor, etc.):
-
-```json
-{
-  "mcpServers": {
-    "spotify": {
-      "command": "uv",
-      "args": [
-        "--directory",
-        "/path/to/spotify-mcp",
-        "run",
-        "spotify-mcp"
-      ],
-      "env": {
-        "SPOTIFY_CLIENT_ID": "your_client_id",
-        "SPOTIFY_CLIENT_SECRET": "your_client_secret",
-        "SPOTIFY_REDIRECT_URI": "http://127.0.0.1:8080/callback"
-      }
-    }
-  }
-}
-```
-
-#### Run with uvx
-
-```json
-{
-  "mcpServers": {
-    "spotify": {
-      "command": "uvx",
-      "args": [
-        "--python", "3.12",
-        "--from", "git+https://github.com/verIdyia/spotify-mcp",
-        "spotify-mcp"
-      ],
-      "env": {
-        "SPOTIFY_CLIENT_ID": "your_client_id",
-        "SPOTIFY_CLIENT_SECRET": "your_client_secret",
-        "SPOTIFY_REDIRECT_URI": "http://127.0.0.1:8080/callback"
-      }
-    }
-  }
-}
-```
-
-### Environment Variables
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `SPOTIFY_CLIENT_ID` | Yes | -- | Spotify app Client ID |
-| `SPOTIFY_CLIENT_SECRET` | Yes | -- | Spotify app Client Secret |
-| `SPOTIFY_REDIRECT_URI` | No | `http://127.0.0.1:8080/callback` | OAuth redirect URI |
-| `SPOTIFY_CACHE_PATH` | No | `~/.spotify_mcp_cache.json` | Token cache file path |
-
-## Troubleshooting
-
-1. **First run**: Run `spotify-mcp --auth` to complete the OAuth flow before using with an MCP client
-2. **Token expired**: Tokens auto-refresh. If issues persist, re-run `--auth`
-3. **No active device**: Make sure Spotify is open and playing on at least one device
-4. **Make sure `uv` is updated** -- version `>=0.54` recommended
-
-### Debugging
-
-Launch the MCP Inspector:
-
-```bash
-npx @modelcontextprotocol/inspector uv --directory /path/to/spotify-mcp run spotify-mcp
-```
-
-## Spotify API Feb 2026 Changes Summary
-
-| Change | Impact | Status |
-|--------|--------|--------|
-| Search `limit` max reduced 50 -> 10 | Fewer results per search | Adapted |
-| Playlist endpoints `/tracks` -> `/items` | Endpoint URLs changed | Adapted |
-| Response field `tracks` -> `items` | Parsing updated | Adapted |
-| Batch GET endpoints removed | Must fetch individually | Adapted |
-| `popularity` field removed from tracks | No longer available | Handled |
-| Dev Mode: 5 user limit, Premium required | Access restriction | Documented |
-
-## Credits
-
-- **Original project**: [varunneal/spotify-mcp](https://github.com/varunneal/spotify-mcp) by [Varun Srivastava](https://github.com/varunneal) (MIT License)
-- **Original contributors**: @jamiew, @davidpadbury, @manncodes, @hyuma7, @aanurraj, @JJGO and others
-- **Built with**: [httpx](https://github.com/encode/httpx), [MCP SDK](https://github.com/modelcontextprotocol/python-sdk)
-- **Maintained with**: [Claude Code](https://claude.ai/claude-code) (Anthropic)
-
-## License
-
-MIT License -- see [LICENSE](LICENSE) for details.
+Tests use mocked Spotify responses and do not require credentials. Live OAuth,
+account-specific API access, and actual playlist creation require your account
+and have not been verified in this review.

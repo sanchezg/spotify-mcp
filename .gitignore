@@ -28,3 +28,8 @@ Thumbs.db
 # Virtual environment
 .venv/
 venv/
+
+.spotify_mcp_cache.json
+.spotify-token-*
+playlist-plan.json
+preferences.json
